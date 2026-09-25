@@ -8,6 +8,7 @@ from beancount.core import amount, data
 from beancount.core.number import D
 
 from tariochbctools.importers.general.deduplication import ReferenceDuplicatesComparator
+from tariochbctools.importers.general.network import REQUEST_TIMEOUT
 
 
 class HttpServiceException(Exception):
@@ -20,11 +21,11 @@ class Importer(beangulp.Importer):
     def identify(self, filepath: str) -> bool:
         return path.basename(filepath).endswith("nordigen.yaml")
 
-    def account(self, filepath: str) -> data.Entries:
+    def account(self, filepath: str) -> data.Account:
         return ""
 
     def extract(self, filepath: str, existing: data.Entries) -> data.Entries:
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             config = yaml.safe_load(f)
 
         r = requests.post(
@@ -33,27 +34,29 @@ class Importer(beangulp.Importer):
                 "secret_id": config["secret_id"],
                 "secret_key": config["secret_key"],
             },
+            timeout=REQUEST_TIMEOUT,
         )
         try:
             r.raise_for_status()
         except requests.exceptions.HTTPError as e:
-            raise HttpServiceException(e, e.response.text)
+            raise HttpServiceException(e, r.text) from e
 
         token = r.json()["access"]
         headers = {"Authorization": "Bearer " + token}
 
-        entries = []
+        entries: data.Entries = []
         for account in config["accounts"]:
             accountId = account["id"]
             assetAccount = account["asset_account"]
             r = requests.get(
                 f"https://bankaccountdata.gocardless.com/api/v2/accounts/{accountId}/transactions/",
                 headers=headers,
+                timeout=REQUEST_TIMEOUT,
             )
             try:
                 r.raise_for_status()
             except requests.exceptions.HTTPError as e:
-                raise HttpServiceException(e, e.response.text)
+                raise HttpServiceException(e, r.text) from e
 
             transactions = sorted(
                 r.json()["transactions"]["booked"], key=lambda trx: trx["bookingDate"]

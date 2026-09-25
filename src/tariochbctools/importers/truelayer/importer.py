@@ -1,4 +1,5 @@
 import logging
+import subprocess
 from datetime import timedelta
 from os import path
 from typing import Any
@@ -11,6 +12,7 @@ from beancount.core import amount, data
 from beancount.core.number import D
 
 from tariochbctools.importers.general.deduplication import ReferenceDuplicatesComparator
+from tariochbctools.importers.general.network import REQUEST_TIMEOUT
 
 # https://docs.truelayer.com/#retrieve-account-transactions
 
@@ -30,22 +32,39 @@ TX_OPTIONAL_META_ID_FIELDS = (
 class Importer(beangulp.Importer):
     """An importer for Truelayer API (e.g. for Revolut)."""
 
-    def __init__(self):
-        self.config = None
-        self.clientId = None
-        self.clientSecret = None
-        self.refreshToken = None
-        self.sandbox = None
-        self.existing = None
+    def __init__(self) -> None:
+        self.config: Any = None
+        self.clientId: str | None = None
+        self.clientSecret: str | None = None
+        self.refreshToken: str | None = None
+        self.authCommand: str | None = None
+        self.sandbox: bool | None = None
+        self.existing: data.Entries | None = None
         self.domain = "truelayer.com"
 
-    def _configure(self, filepath: str, existing: data.Entries) -> None:
-        with open(filepath, "r") as f:
+    def _configure(self, filepath: str, existing: data.Entries | None) -> None:
+        with open(filepath) as f:
             self.config = yaml.safe_load(f)
-        self.clientId = self.config["client_id"]
-        self.clientSecret = self.config["client_secret"]
-        self.refreshToken = self.config["refresh_token"]
-        self.sandbox = self.clientId.startswith("sandbox")
+
+        self.authCommand = self.config.get("auth_command")
+        self.accessToken = self.config.get("access_token")
+
+        # client_id/secret and refresh_token only required if no auth_command
+        if not self.authCommand:
+            self.clientId = self.config["client_id"]
+            self.clientSecret = self.config["client_secret"]
+            # refresh_token required if no access_token either
+            if not self.accessToken:
+                self.refreshToken = self.config["refresh_token"]
+            else:
+                self.refreshToken = self.config.get("refresh_token")
+        else:
+            # Optional: allow client_id for sandbox detection
+            self.clientId = self.config.get("client_id")
+            self.clientSecret = self.config.get("client_secret")
+            self.refreshToken = self.config.get("refresh_token")
+
+        self.sandbox = bool(self.clientId and self.clientId.startswith("sandbox"))
         self.existing = existing
 
         if self.sandbox:
@@ -60,21 +79,62 @@ class Importer(beangulp.Importer):
     def account(self, filepath: str) -> data.Account:
         return ""
 
-    def extract(self, filepath: str, existing: data.Entries = None) -> data.Entries:
+    def _get_access_token(self) -> str:
+        """return access token from cache, config or auth_command"""
+        if self.accessToken:
+            return self.accessToken
+
+        if self.authCommand:
+            logging.info("Running auth_command: %s", self.authCommand)
+            result = subprocess.run(
+                self.authCommand,
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                stdout = result.stdout.strip()
+                error_parts = [
+                    f"auth_command failed with exit code {result.returncode}"
+                ]
+                if stderr:
+                    error_parts.append(f"stderr: {stderr}")
+                if stdout:
+                    error_parts.append(f"stdout: {stdout}")
+                if "oama" in self.authCommand:
+                    error_parts.append(
+                        "If using oama, you may need to re-authorize: "
+                        "oama authorize truelayer <your-account>"
+                    )
+                raise RuntimeError("; ".join(error_parts))
+            token = result.stdout.strip()
+            if not token:
+                raise RuntimeError("auth_command produced no output")
+            self.accessToken = token
+        else:
+            r = requests.post(
+                f"https://auth.{self.domain}/connect/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": self.clientId,
+                    "client_secret": self.clientSecret,
+                    "refresh_token": self.refreshToken,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            tokens = r.json()
+            self.accessToken = tokens["access_token"]
+
+        return self.accessToken
+
+    def extract(
+        self, filepath: str, existing: data.Entries | None = None
+    ) -> data.Entries:
         self._configure(filepath, existing)
 
-        r = requests.post(
-            f"https://auth.{self.domain}/connect/token",
-            data={
-                "grant_type": "refresh_token",
-                "client_id": self.clientId,
-                "client_secret": self.clientSecret,
-                "refresh_token": self.refreshToken,
-            },
-        )
-        tokens = r.json()
-        accessToken = tokens["access_token"]
-        headers = {"Authorization": "Bearer " + accessToken}
+        access_token = self._get_access_token()
+        headers = {"Authorization": "Bearer " + access_token}
 
         entries = []
         entries.extend(self._extract_endpoint_transactions("accounts", headers))
@@ -84,7 +144,7 @@ class Importer(beangulp.Importer):
 
         return entries
 
-    def _get_account_for_account_id(self, account_id: str) -> data.Account:
+    def _get_account_for_account_id(self, account_id: str) -> data.Account | None:
         """
         Find a matching account for the account ID.
         If the user hasn't specified any in the config, return
@@ -105,9 +165,11 @@ class Importer(beangulp.Importer):
     def _extract_endpoint_transactions(
         self, endpoint: str, headers: dict[str, str], invert_sign: bool = False
     ) -> data.Entries:
-        entries = []
+        entries: data.Entries = []
         r = requests.get(
-            f"https://api.{self.domain}/data/v1/{endpoint}", headers=headers
+            f"https://api.{self.domain}/data/v1/{endpoint}",
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
         )
 
         if not r:
@@ -130,6 +192,7 @@ class Importer(beangulp.Importer):
             r = requests.get(
                 f"https://api.{self.domain}/data/v1/{endpoint}/{accountId}/balance",
                 headers=headers,
+                timeout=REQUEST_TIMEOUT,
             )
             balances = r.json()["results"]
 
@@ -141,6 +204,7 @@ class Importer(beangulp.Importer):
             r = requests.get(
                 f"https://api.{self.domain}/data/v1/{endpoint}/{accountId}/transactions",
                 headers=headers,
+                timeout=REQUEST_TIMEOUT,
             )
             transactions = sorted(r.json()["results"], key=lambda trx: trx["timestamp"])
 
@@ -159,7 +223,7 @@ class Importer(beangulp.Importer):
         local_account: data.Account,
         transactions: list[Any],
         invert_sign: bool,
-    ) -> data.Transaction:
+    ) -> list[data.Transaction]:
         entries = []
         metakv: dict[str, Any] = {}
 
@@ -213,7 +277,7 @@ class Importer(beangulp.Importer):
         result: dict[str, Any],
         local_account: data.Account,
         invert_sign: bool,
-    ) -> data.Transaction:
+    ) -> list[data.Balance]:
         entries = []
 
         meta = data.new_metadata("", 0)

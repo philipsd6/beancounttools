@@ -1,6 +1,6 @@
 import base64
 import json
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from os import path
 from typing import Any
 from urllib.parse import urlencode
@@ -16,8 +16,15 @@ from beancount.core.number import D
 from dateutil.relativedelta import relativedelta
 
 from tariochbctools.importers.general.deduplication import ReferenceDuplicatesComparator
+from tariochbctools.importers.general.network import (
+    CONNECT_TIMEOUT,
+    READ_TIMEOUT,
+    REQUEST_TIMEOUT,
+)
 
-http = urllib3.PoolManager()
+http = urllib3.PoolManager(
+    timeout=urllib3.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT)
+)
 
 
 class Importer(beangulp.Importer):
@@ -38,13 +45,13 @@ class Importer(beangulp.Importer):
             self.startDate = datetime.combine(
                 date.today() + relativedelta(months=-3),
                 datetime.min.time(),
-                timezone.utc,
+                UTC,
             ).isoformat()
         if "endDate" in kwargs:
             self.endDate = kwargs.pop("endDate")
         else:
             self.endDate = datetime.combine(
-                date.today(), datetime.max.time(), timezone.utc
+                date.today(), datetime.max.time(), UTC
             ).isoformat()
         super().__init__(*args, **kwargs)
 
@@ -99,7 +106,7 @@ class Importer(beangulp.Importer):
         else:
             raise Exception("Failed to get transactions.")
 
-    def _do_sca_challenge(self):
+    def _do_sca_challenge(self) -> str:
         # Read the private key file as bytes.
         with open(self.private_key_path, "rb") as f:
             private_key_data = f.read()
@@ -108,6 +115,7 @@ class Importer(beangulp.Importer):
 
         # Use the private key to sign the one-time-token that was returned
         # in the x-2fa-approval header of the HTTP 403.
+        assert self.one_time_token is not None
         signed_token = rsa.sign(
             self.one_time_token.encode("ascii"), private_key, "SHA-256"
         )
@@ -118,8 +126,8 @@ class Importer(beangulp.Importer):
 
         return signature
 
-    def extract(self, filepath, existing):
-        with open(filepath, "r") as f:
+    def extract(self, filepath: str, existing: data.Entries) -> data.Entries:
+        with open(filepath) as f:
             config = yaml.safe_load(f)
         self.api_token = config["token"]
         baseAccount = config["baseAccount"]
@@ -128,7 +136,9 @@ class Importer(beangulp.Importer):
         headers = {"Authorization": "Bearer " + self.api_token}
         if not self.profileId:
             r = requests.get(
-                "https://api.transferwise.com/v1/profiles", headers=headers
+                "https://api.transferwise.com/v1/profiles",
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
             )
             profiles = r.json()
             self.profileId = profiles[0]["id"]
@@ -137,11 +147,12 @@ class Importer(beangulp.Importer):
             "https://api.transferwise.com/v1/borderless-accounts",
             params={"profileId": self.profileId},
             headers=headers,
+            timeout=REQUEST_TIMEOUT,
         )
         accounts = r.json()
         self.accountId = accounts[0]["id"]
 
-        entries = []
+        entries: data.Entries = []
         base_url = "https://api.transferwise.com"
         for account in accounts[0]["balances"]:
             accountCcy = account["currency"]

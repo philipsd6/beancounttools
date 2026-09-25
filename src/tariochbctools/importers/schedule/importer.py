@@ -19,11 +19,11 @@ class Importer(beangulp.Importer):
         return ""
 
     def extract(self, filepath: str, existing: data.Entries) -> data.Entries:
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             config = yaml.safe_load(f)
         self.transactions = config["transactions"]
 
-        result = []
+        result: data.Entries = []
         for trx in config["transactions"]:
             for i in reversed(range(1, 6)):
                 date = datetime.date.today() + relativedelta(months=-i, day=31)

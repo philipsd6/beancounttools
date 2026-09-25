@@ -9,6 +9,25 @@ from beancount.core.number import D
 from tariochbctools.importers.general.deduplication import ReferenceDuplicatesComparator
 
 
+def detect_encoding(filepath: str) -> str:
+    """Encoding to hand over to mt940.
+
+    Without one, mt940 decodes everything that is not utf-8 as cp852, which
+    garbles e.g. the umlauts of the latin-1 files that the banks deliver.
+    """
+    with open(filepath, "rb") as f:
+        content = f.read()
+
+    for encoding in ("utf-8", "cp1252"):
+        try:
+            content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        return encoding
+
+    return "latin-1"
+
+
 class Importer(beangulp.Importer):
     """An importer for MT940 files."""
 
@@ -23,8 +42,8 @@ class Importer(beangulp.Importer):
         return self._account
 
     def extract(self, filepath: str, existing: data.Entries) -> data.Entries:
-        entries = []
-        transactions = mt940.parse(filepath)
+        entries: data.Entries = []
+        transactions = mt940.parse(filepath, encoding=detect_encoding(filepath))
         for trx in transactions:
             trxdata = trx.data
             ref = trxdata["bank_reference"]
@@ -37,12 +56,20 @@ class Importer(beangulp.Importer):
                 date = trxdata["entry_date"]
             else:
                 date = trxdata["date"]
+            payee = self.prepare_payee(trxdata)
+            if payee:
+                payee = re.sub(r"\s+", " ", payee.strip())
+
+            narration = self.prepare_narration(trxdata)
+            if narration:
+                narration = re.sub(r"\s+", " ", narration.strip())
+
             entry = data.Transaction(
                 meta,
                 date,
                 "*",
-                self.prepare_payee(trxdata),
-                self.prepare_narration(trxdata),
+                payee,
+                narration,
                 data.EMPTY_SET,
                 data.EMPTY_SET,
                 [

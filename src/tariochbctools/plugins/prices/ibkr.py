@@ -1,11 +1,9 @@
 from datetime import datetime
 from os import environ
-from time import sleep
-from typing import Optional
+from zoneinfo import ZoneInfo
 
 from beancount.core.number import D
 from beanprice import source
-from dateutil import tz
 from ibflex import client, parser
 
 
@@ -14,27 +12,31 @@ class Source(source.Source):
         token: str = environ["IBKR_TOKEN"]
         queryId: str = environ["IBKR_QUERY_ID"]
 
-        try:
-            response = client.download(token, queryId)
-        except client.ResponseCodeError as e:
-            if e.code == "1018":
-                sleep(10)
-                response = client.download(token, queryId)
-            else:
-                raise e
+        response = client.download(token, queryId)
 
         statement = parser.parse(response)
         for custStatement in statement.FlexStatements:
             for position in custStatement.OpenPositions:
+                if position.symbol is None:
+                    # cannot be the requested ticker
+                    continue
+
                 symbol = position.symbol
                 symbol = symbol.rstrip("z")
                 symbol, _, _ = symbol.partition(".")
                 if symbol == ticker:
+                    if position.reportDate is None:
+                        raise ValueError(
+                            "The flex query does not include the field reportDate"
+                        )
+
                     price = D(position.markPrice)
-                    timezone = tz.gettz("Europe/Zurich")
+                    # midnight in Zurich, whatever the time zone of the machine is
                     time = datetime.combine(
-                        position.reportDate, datetime.min.time()
-                    ).astimezone(timezone)
+                        position.reportDate,
+                        datetime.min.time(),
+                        tzinfo=ZoneInfo("Europe/Zurich"),
+                    )
 
                     return source.SourcePrice(price, time, position.currency)
 
@@ -42,5 +44,5 @@ class Source(source.Source):
 
     def get_historical_price(
         self, ticker: str, time: datetime
-    ) -> Optional[source.SourcePrice]:
+    ) -> source.SourcePrice | None:
         return None
